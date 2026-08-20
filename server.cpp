@@ -240,7 +240,7 @@ static uint64_t str_hash(const uint8_t *data, size_t len) {
   return h;
 }
 
-static void do_get(vector<string> &cmd, Response &out) {
+static void do_get(vector<string> &cmd, Buffer &out) {
   // We create a dummy `Entry` just for the lookup. We only populate its key and
   // hcode.
   Entry key;
@@ -251,7 +251,7 @@ static void do_get(vector<string> &cmd, Response &out) {
   // to handle collisions.
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
   if (!node) {
-    out.status = RES_NX; // Not Found
+    out_nil(out); // Not Found
     return;
   }
 
@@ -259,10 +259,10 @@ static void do_get(vector<string> &cmd, Response &out) {
   // pointer, then grab `val`.
   const string &val = container_of(node, Entry, node)->val;
   assert(val.size() <= k_max_msg);
-  out.data.assign(val.begin(), val.end()); // Copy value to response
+  out_str(out, val); // Copy value to response
 }
 
-static void do_set(vector<string> &cmd, Response &) {
+static void do_set(vector<string> &cmd, Buffer &out) {
   // a dummy `Entry` just for the lookup
   Entry key;
   key.key.swap(cmd[1]);
@@ -281,9 +281,10 @@ static void do_set(vector<string> &cmd, Response &) {
     ent->val.swap(cmd[2]);             // Move the value string in
     hm_insert(&g_data.db, &ent->node); // Insert into hashtable
   }
+  out_nil(out);
 }
 
-static void do_del(vector<string> &cmd, Response &) {
+static void do_del(vector<string> &cmd, Buffer &out) {
   // a dummy `Entry` just for the lookup
   Entry key;
   key.key.swap(cmd[1]);
@@ -295,26 +296,57 @@ static void do_del(vector<string> &cmd, Response &) {
   if (node) {
     // It's our responsibility to actually free the memory!
     delete container_of(node, Entry, node);
+    out_int(out, 1); // 1 means success
+  } else {
+    out_int(out, 0); // 0 means failure
   }
 }
+static bool cb_keys(HNode *node, void *arg) {
+  Buffer &out = *(Buffer *)arg;
+  const string &key = container_of(node, Entry, node)->key;
+  out_str(out, key);
+  return true;
+}
 
-static void do_request(vector<string> &cmd, Response &out) {
+static void do_keys(vector<string> &cmd, Buffer &out) {
+  // Write the Array Tag and the Total Length
+  out_arr(out, (uint32_t)hm_size(&g_data.db));
+  // Tell the hashtable to run `cb_keys` on every single node!
+  hm_foreach(&g_data.db, &cb_keys, (void *)&out);
+}
+
+static void do_request(vector<string> &cmd, Buffer &out) {
   if (cmd.size() == 2 && cmd[0] == "get") {
     return do_get(cmd, out);
   } else if (cmd.size() == 3 && cmd[0] == "set") {
     return do_set(cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "del") {
     return do_del(cmd, out);
+  } else if (cmd.size() == 1 && cmd[0] == "keys") {
+    return do_keys(cmd, out);
   } else {
-    out.status = RES_ERR; // unrecognized command
+    out_err(out, 400, "bad command");
   }
 }
+static void response_begin(Buffer &out, size_t *header) {
+  *header = out.size();   // Remember where the header started
+  buf_append_u32(out, 0); // Reserve 4 bytes of space with zeros
+}
 
-static void make_response(const Response &resp, vector<uint8_t> &out) {
-  uint32_t resp_len = 4 + (uint32_t)resp.data.size();
-  buf_append(out, (const uint8_t *)&resp_len, 4);
-  buf_append(out, (const uint8_t *)&resp.status, 4);
-  buf_append(out, resp.data.data(), resp.data.size());
+static size_t response_size(Buffer &out, size_t header) {
+  return out.size() - header - 4; // Calculate how many bytes do_request added
+}
+
+static void response_end(Buffer &out, size_t header) {
+  size_t msg_size = response_size(out, header);
+  if (msg_size > k_max_msg) {
+    out.resize(header + 4); // Oops, too big. Erase what do_request wrote.
+    out_err(out, 2, "response is too big.");
+    msg_size = response_size(out, header);
+  }
+  // Go back to the reserved space and write the real length!
+  uint32_t len = (uint32_t)msg_size;
+  memcpy(&out[header], &len, 4);
 }
 
 // process 1 request if there is enough data
@@ -343,9 +375,10 @@ static bool try_one_request(Conn *conn) {
     conn->want_close = true;
     return false; // want close
   }
-  Response resp;
-  do_request(cmd, resp);
-  make_response(resp, conn->outgoing);
+  size_t header_pos = 0;
+  response_begin(conn->outgoing, &header_pos);
+  do_request(cmd, conn->outgoing);
+  response_end(conn->outgoing, header_pos);
 
   // application logic done! remove the request message.
   buf_consume(conn->incoming, 4 + len);
