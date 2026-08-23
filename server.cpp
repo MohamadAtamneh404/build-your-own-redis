@@ -17,6 +17,8 @@
 #include <vector>
 // proj
 #include "hashtable.h"
+#include "zset.h"
+#include <math.h>
 
 using namespace std;
 // A helpful alias so we don't have to type std::vector<uint8_t> over and over
@@ -208,15 +210,18 @@ static struct {
   HMap db; // top-level hashtable instead of std::map
 } g_data;
 
+enum {
+  T_STR = 0,
+  T_ZSET = 1,
+};
+
 // KV pair for the top-level hashtable.
-// We embed the `HNode` struct directly inside our Entry struct.
-// This is an "intrusive" data structure. The hashtable algorithm only sees
-// `node`, but using the `container_of` macro, we can get back to the `key` and
-// `val`.
 struct Entry {
   struct HNode node; // hashtable node
   string key;
   string val;
+  uint32_t type = 0;
+  ZSet *zset = NULL;
 };
 
 // equality comparison for `struct Entry`
@@ -240,6 +245,35 @@ static uint64_t str_hash(const uint8_t *data, size_t len) {
   return h;
 }
 
+static bool str2dbl(const string &s, double &out) {
+    char *endp = NULL;
+    out = strtod(s.c_str(), &endp);
+    return endp == s.c_str() + s.size() && !isnan(out);
+}
+
+static bool str2int(const string &s, int64_t &out) {
+    char *endp = NULL;
+    out = strtoll(s.c_str(), &endp, 10);
+    return endp == s.c_str() + s.size();
+}
+
+static bool expect_zset(Buffer &out, string &s, Entry **ent) {
+    Entry key;
+    key.key.swap(s);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!hnode) {
+        out_nil(out);
+        return false;
+    }
+    *ent = container_of(hnode, Entry, node);
+    if ((*ent)->type != T_ZSET) {
+        out_err(out, 400, "wrong type: expected zset");
+        return false;
+    }
+    return true;
+}
+
 static void do_get(vector<string> &cmd, Buffer &out) {
   // We create a dummy `Entry` just for the lookup. We only populate its key and
   // hcode.
@@ -257,7 +291,12 @@ static void do_get(vector<string> &cmd, Buffer &out) {
 
   // found! We use container_of to turn the raw HNode pointer back into an Entry
   // pointer, then grab `val`.
-  const string &val = container_of(node, Entry, node)->val;
+  Entry *ent = container_of(node, Entry, node);
+  if (ent->type != T_STR) {
+      out_err(out, 400, "wrong type");
+      return;
+  }
+  const string &val = ent->val;
   assert(val.size() <= k_max_msg);
   out_str(out, val); // Copy value to response
 }
@@ -271,14 +310,20 @@ static void do_set(vector<string> &cmd, Buffer &out) {
   // hashtable lookup
   HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
   if (node) {
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->type != T_STR) {
+        out_err(out, 400, "wrong type");
+        return;
+    }
     // Key already exists! Update the value in place using swap for performance.
-    container_of(node, Entry, node)->val.swap(cmd[2]);
+    ent->val.swap(cmd[2]);
   } else {
     // Key does not exist. Allocate a brand new Entry pair on the heap.
     Entry *ent = new Entry();
     ent->key.swap(key.key);            // Move the key string in
     ent->node.hcode = key.node.hcode;  // Save the pre-calculated hash
     ent->val.swap(cmd[2]);             // Move the value string in
+    ent->type = T_STR;
     hm_insert(&g_data.db, &ent->node); // Insert into hashtable
   }
   out_nil(out);
@@ -294,8 +339,12 @@ static void do_del(vector<string> &cmd, Buffer &out) {
   // us
   HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
   if (node) {
-    // It's our responsibility to actually free the memory!
-    delete container_of(node, Entry, node);
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->type == T_ZSET) {
+        zset_dispose(ent->zset);
+        delete ent->zset;
+    }
+    delete ent;
     out_int(out, 1); // 1 means success
   } else {
     out_int(out, 0); // 0 means failure
@@ -315,6 +364,119 @@ static void do_keys(vector<string> &cmd, Buffer &out) {
   hm_foreach(&g_data.db, &cb_keys, (void *)&out);
 }
 
+static void do_zadd(vector<string> &cmd, Buffer &out) {
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) {
+        out_err(out, 400, "expect fp number");
+        return;
+    }
+
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    Entry *ent = NULL;
+    if (!hnode) {
+        ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->type = T_ZSET;
+        ent->zset = new ZSet();
+        hm_insert(&g_data.db, &ent->node);
+    } else {
+        ent = container_of(hnode, Entry, node);
+        if (ent->type != T_ZSET) {
+            out_err(out, 400, "wrong type");
+            return;
+        }
+    }
+
+    const string &name = cmd[3];
+    bool added = zset_add(ent->zset, name.data(), name.size(), score);
+    out_int(out, (int64_t)added);
+}
+
+static void do_zrem(vector<string> &cmd, Buffer &out) {
+    Entry *ent = NULL;
+    if (!expect_zset(out, cmd[1], &ent)) {
+        return;
+    }
+
+    const string &name = cmd[2];
+    ZNode *znode = zset_pop(ent->zset, name.data(), name.size());
+    if (znode) {
+        delete znode;
+        out_int(out, 1);
+    } else {
+        out_int(out, 0);
+    }
+}
+
+static void do_zscore(vector<string> &cmd, Buffer &out) {
+    Entry *ent = NULL;
+    if (!expect_zset(out, cmd[1], &ent)) {
+        return;
+    }
+
+    const string &name = cmd[2];
+    ZNode *znode = zset_lookup(ent->zset, name.data(), name.size());
+    if (znode) {
+        out_str(out, to_string(znode->score));
+    } else {
+        out_nil(out);
+    }
+}
+
+static void do_zquery(vector<string> &cmd, Buffer &out) {
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) {
+        out_err(out, 400, "expect fp number");
+        return;
+    }
+    const string &name = cmd[3];
+    int64_t offset = 0;
+    int64_t limit = 0;
+    if (!str2int(cmd[4], offset)) {
+        out_err(out, 400, "expect int");
+        return;
+    }
+    if (!str2int(cmd[5], limit)) {
+        out_err(out, 400, "expect int");
+        return;
+    }
+
+    Entry *ent = NULL;
+    if (!expect_zset(out, cmd[1], &ent)) {
+        if (out.back() == TAG_NIL) { // doesn't exist, return empty array
+            out.pop_back();
+            out_arr(out, 0);
+        }
+        return;
+    }
+
+    ZNode *znode = zset_query(ent->zset, score, name.data(), name.size(), offset);
+    
+    // We output an array of strings (name, score, name, score...)
+    // But we need to write the array length first. We'll reserve space and fix it later.
+    size_t arr_len_pos = out.size();
+    out_arr(out, 0);
+    
+    uint32_t count = 0;
+    while (znode && count < (uint32_t)limit) {
+        out_str(out, znode->name);
+        out_str(out, to_string(znode->score));
+        
+        // move to the next node by using offset 1
+        AVLNode *next_node = avl_offset(&znode->tree_node, 1);
+        znode = next_node ? container_of(next_node, ZNode, tree_node) : NULL;
+        count += 2; // We wrote 2 items (name and score)
+    }
+    // Update the array length!
+    uint32_t network_count = count;
+    memcpy(&out[arr_len_pos + 1], &network_count, 4);
+}
+
 static void do_request(vector<string> &cmd, Buffer &out) {
   if (cmd.size() == 2 && cmd[0] == "get") {
     return do_get(cmd, out);
@@ -324,6 +486,14 @@ static void do_request(vector<string> &cmd, Buffer &out) {
     return do_del(cmd, out);
   } else if (cmd.size() == 1 && cmd[0] == "keys") {
     return do_keys(cmd, out);
+  } else if (cmd.size() == 4 && cmd[0] == "zadd") {
+    return do_zadd(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "zrem") {
+    return do_zrem(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "zscore") {
+    return do_zscore(cmd, out);
+  } else if (cmd.size() == 6 && cmd[0] == "zquery") {
+    return do_zquery(cmd, out);
   } else {
     out_err(out, 400, "bad command");
   }

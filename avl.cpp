@@ -63,18 +63,20 @@ static AVLNode *rot_right(AVLNode *node) {
 
 // The left subtree is too deep (Heavy Left side)
 static AVLNode *avl_fix_left(AVLNode *node) {
-  // If the left child's right side is heavier, a single Right Rotation isn't enough!
-  // We first do a Left Rotation on the child (Transformation 2), then a Right Rotation on the parent (Transformation 1)
+  // If the left child's right side is heavier, a single Right Rotation isn't
+  // enough! We first do a Left Rotation on the child (Transformation 2), then a
+  // Right Rotation on the parent (Transformation 1)
   if (avl_height(node->left->left) < avl_height(node->left->right)) {
-    node->left = rot_left(node->left); 
+    node->left = rot_left(node->left);
   }
-  return rot_right(node); 
+  return rot_right(node);
 }
 
 // The right subtree is too deep (Heavy Right side)
 static AVLNode *avl_fix_right(AVLNode *node) {
-  // If the right child's left side is heavier, a single Left Rotation isn't enough!
-  // We first do a Right Rotation on the child, then a Left Rotation on the parent.
+  // If the right child's left side is heavier, a single Left Rotation isn't
+  // enough! We first do a Right Rotation on the child, then a Left Rotation on
+  // the parent.
   if (avl_height(node->right->right) < avl_height(node->right->left)) {
     node->right = rot_right(node->right);
   }
@@ -113,23 +115,23 @@ AVLNode *avl_fix(AVLNode *node) {
 // It returns the new root of the tree.
 static AVLNode *avl_del_easy(AVLNode *node) {
   assert(!node->left || !node->right); // Ensure we don't have 2 children!
-  
+
   // Grab the child (if it has one), otherwise this will be NULL
-  AVLNode *child = node->left ? node->left : node->right; 
+  AVLNode *child = node->left ? node->left : node->right;
   AVLNode *parent = node->parent;
-  
+
   // Step 1: Tell the child who its new parent is
   if (child) {
-    child->parent = parent; 
+    child->parent = parent;
   }
-  
+
   // Step 2: Tell the parent who its new child is
   if (!parent) {
     return child; // We just deleted the absolute root of the tree!
   }
   AVLNode **from = parent->left == node ? &parent->left : &parent->right;
   *from = child;
-  
+
   // Step 3: Now that the node is deleted, the tree might be unbalanced. Fix it!
   return avl_fix(parent);
 }
@@ -140,20 +142,24 @@ AVLNode *avl_del(AVLNode *node) {
   if (!node->left || !node->right) {
     return avl_del_easy(node);
   }
-  
-  // Hard Case: The node has 2 children. We cannot simply delete it, or the children get orphaned!
-  // Solution: Find the "Successor" (the next largest node). We will swap places with the successor.
+
+  // Hard Case: The node has 2 children. We cannot simply delete it, or the
+  // children get orphaned! Solution: Find the "Successor" (the next largest
+  // node). We will swap places with the successor.
   AVLNode *victim = node->right;
   while (victim->left) {
-    victim = victim->left; // Keep going left to find the smallest node in the right subtree
+    victim = victim->left; // Keep going left to find the smallest node in the
+                           // right subtree
   }
-  
-  // The successor is guaranteed to have at most 1 child, so we can use `del_easy` to rip it out.
+
+  // The successor is guaranteed to have at most 1 child, so we can use
+  // `del_easy` to rip it out.
   AVLNode *root = avl_del_easy(victim);
-  
-  // Now we literally swap the victim into the exact spot where `node` was sitting!
+
+  // Now we literally swap the victim into the exact spot where `node` was
+  // sitting!
   *victim = *node; // Copy left, right, and parent pointers
-  
+
   // Tell the children that they have a new parent now (the victim)
   if (victim->left) {
     victim->left->parent = victim;
@@ -161,7 +167,7 @@ AVLNode *avl_del(AVLNode *node) {
   if (victim->right) {
     victim->right->parent = victim;
   }
-  
+
   // Tell the grandparent that it has a new child now (the victim)
   AVLNode **from = &root;
   AVLNode *parent = node->parent;
@@ -169,6 +175,32 @@ AVLNode *avl_del(AVLNode *node) {
     from = parent->left == node ? &parent->left : &parent->right;
   }
   *from = victim;
-  
+
   return root;
+}
+
+// Find a node by its rank (offset)
+AVLNode *avl_offset(AVLNode *node, int64_t offset) {
+  int64_t pos = 0; // relative to the starting node
+  while (offset != pos) {
+    if (pos < offset && node->right) {
+      node = node->right;
+      pos += avl_cnt(node->left) + 1;
+    } else if (pos > offset && node->left) {
+      node = node->left;
+      pos -= avl_cnt(node->right) + 1;
+    } else {
+      AVLNode *parent = node->parent;
+      if (!parent) {
+        return NULL;
+      }
+      if (parent->right == node) {
+        pos -= avl_cnt(node->left) + 1;
+      } else {
+        pos += avl_cnt(node->right) + 1;
+      }
+      node = parent;
+    }
+  }
+  return node;
 }

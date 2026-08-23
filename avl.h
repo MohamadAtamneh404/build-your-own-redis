@@ -21,6 +21,6 @@ static uint32_t avl_height(AVLNode *node) { return node ? node->height : 0; }
 
 static uint64_t avl_cnt(AVLNode *node) { return node ? node->cnt : 0; }
 
-// API
 AVLNode *avl_fix(AVLNode *node);
 AVLNode *avl_del(AVLNode *node);
+AVLNode *avl_offset(AVLNode *node, int64_t offset);
