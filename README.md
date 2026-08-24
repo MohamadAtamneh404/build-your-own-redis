@@ -92,7 +92,7 @@ Built following [Build Your Own Redis with C/C++](https://build-your-own.org/red
 
 ## 👤 Author
 
-**Mohamad Atamneh** — Software Engineer | B.Sc. Software Engineering (GPA: 89)
+**Mohamad Atamneh** — Software Engineer | B.Sc. Software Engineering 
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=flat-square&logo=linkedin&logoColor=white)](https://linkedin.com/in/mohamad-atamleh-a43185381)
 [![GitHub](https://img.shields.io/badge/GitHub-181717?style=flat-square&logo=github&logoColor=white)](https://github.com/MohamadAtamneh404)
