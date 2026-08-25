@@ -1,0 +1,67 @@
+#include "heap.h"
+
+// In a binary tree stored in an array:
+// The parent of index `i` is at `(i - 1) / 2`
+static size_t heap_parent(size_t i) {
+    return (i + 1) / 2 - 1;
+}
+
+// The left child is at `2i + 1`
+static size_t heap_left(size_t i) {
+    return i * 2 + 1;
+}
+
+// The right child is at `2i + 2`
+static size_t heap_right(size_t i) {
+    return i * 2 + 2;
+}
+
+// If a value becomes smaller, it bubbles UP the tree
+static void heap_up(HeapItem *a, size_t pos) {
+    HeapItem t = a[pos];
+    while (pos > 0 && a[heap_parent(pos)].val > t.val) {
+        // Swap with parent
+        a[pos] = a[heap_parent(pos)];
+        *a[pos].ref = pos; // Tell the key its new index!
+        pos = heap_parent(pos);
+    }
+    a[pos] = t;
+    *a[pos].ref = pos;
+}
+
+// If a value becomes larger, it bubbles DOWN the tree
+static void heap_down(HeapItem *a, size_t pos, size_t len) {
+    HeapItem t = a[pos];
+    while (true) {
+        // Find the smallest among the parent and its two kids
+        size_t l = heap_left(pos);
+        size_t r = heap_right(pos);
+        size_t min_pos = (size_t)-1;
+        size_t min_val = t.val;
+
+        if (l < len && a[l].val < min_val) {
+            min_pos = l;
+            min_val = a[l].val;
+        }
+        if (r < len && a[r].val < min_val) {
+            min_pos = r;
+        }
+        if (min_pos == (size_t)-1) {
+            break; // We are perfectly sorted! Stop bubbling.
+        }
+        // Swap with the smallest kid
+        a[pos] = a[min_pos];
+        *a[pos].ref = pos; // Tell the key its new index!
+        pos = min_pos;
+    }
+    a[pos] = t;
+    *a[pos].ref = pos;
+}
+
+void heap_update(HeapItem *a, size_t pos, size_t len) {
+    if (pos > 0 && a[heap_parent(pos)].val > a[pos].val) {
+        heap_up(a, pos);
+    } else {
+        heap_down(a, pos, len);
+    }
+}

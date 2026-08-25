@@ -17,6 +17,7 @@
 #include <vector>
 // proj
 #include "dlist.h"
+#include "heap.h"
 #include "hashtable.h"
 #include "zset.h"
 #include <math.h>
@@ -267,6 +268,7 @@ static int32_t parse_req(const uint8_t *data, size_t size,
 // global states
 static struct {
   HMap db; // top-level hashtable instead of std::map
+  vector<HeapItem> heap; // The min-heap array for TTLs
 } g_data;
 
 enum {
@@ -281,7 +283,60 @@ struct Entry {
   string val;
   uint32_t type = 0;
   ZSet *zset = NULL;
+  size_t heap_idx = -1; // Ticket in the TTL Min-Heap
 };
+
+// --- BEGIN TTL HELPER FUNCTIONS ---
+
+static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
+    if (ttl_ms < 0) ttl_ms = 0; // Negative TTL means instant death
+    
+    uint64_t expire_at = get_monotonic_usec() + (uint64_t)ttl_ms * 1000;
+    
+    if (ent->heap_idx == (size_t)-1) {
+        // The key doesn't have a timer yet! Create a new ticket and push it to the end of the heap.
+        HeapItem item;
+        item.val = expire_at;
+        item.ref = &ent->heap_idx;
+        g_data.heap.push_back(item);
+        ent->heap_idx = g_data.heap.size() - 1;
+        // Bubble it up!
+        heap_update(g_data.heap.data(), ent->heap_idx, g_data.heap.size());
+    } else {
+        // The key already has a timer! Just update its expiration time.
+        g_data.heap[ent->heap_idx].val = expire_at;
+        // Bubble it up or down to keep the heap sorted!
+        heap_update(g_data.heap.data(), ent->heap_idx, g_data.heap.size());
+    }
+}
+
+static void entry_del_ttl(Entry *ent) {
+    if (ent->heap_idx == (size_t)-1) return; // No timer to delete
+    
+    size_t pos = ent->heap_idx;
+    // To delete an item from an array-based tree, you overwrite it with the LAST item in the array
+    g_data.heap[pos] = g_data.heap.back();
+    g_data.heap.pop_back();
+    
+    // Bubble the swapped item into its correct new place!
+    if (pos < g_data.heap.size()) {
+        *g_data.heap[pos].ref = pos; 
+        heap_update(g_data.heap.data(), pos, g_data.heap.size());
+    }
+    ent->heap_idx = -1;
+}
+
+// Safely destroys an entry AND removes its timer!
+static void entry_destroy(Entry *ent) {
+    if (ent->type == T_ZSET) {
+        zset_dispose(ent->zset);
+        delete ent->zset;
+    }
+    entry_del_ttl(ent); // If we delete a key, we MUST remove it from the heap!
+    delete ent;
+}
+
+// --- END TTL HELPER FUNCTIONS ---
 
 // equality comparison for `struct Entry`
 // The hashtable calls this when resolving hash collisions to see if the actual
@@ -376,6 +431,7 @@ static void do_set(vector<string> &cmd, Buffer &out) {
     }
     // Key already exists! Update the value in place using swap for performance.
     ent->val.swap(cmd[2]);
+    entry_del_ttl(ent); // When a key is overwritten, its timer is cleared!
   } else {
     // Key does not exist. Allocate a brand new Entry pair on the heap.
     Entry *ent = new Entry();
@@ -399,11 +455,7 @@ static void do_del(vector<string> &cmd, Buffer &out) {
   HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
   if (node) {
     Entry *ent = container_of(node, Entry, node);
-    if (ent->type == T_ZSET) {
-      zset_dispose(ent->zset);
-      delete ent->zset;
-    }
-    delete ent;
+    entry_destroy(ent); // Safely deletes the key AND its timer from the heap!
     out_int(out, 1); // 1 means success
   } else {
     out_int(out, 0); // 0 means failure
@@ -414,6 +466,55 @@ static bool cb_keys(HNode *node, void *arg) {
   const string &key = container_of(node, Entry, node)->key;
   out_str(out, key);
   return true;
+}
+
+static void do_pexpire(vector<string> &cmd, Buffer &out) {
+  int64_t ttl_ms = 0;
+  if (!str2int(cmd[2], ttl_ms)) {
+    out_err(out, 400, "expect int64");
+    return;
+  }
+
+  Entry key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (node) {
+    Entry *ent = container_of(node, Entry, node);
+    entry_set_ttl(ent, ttl_ms);
+    out_int(out, 1);
+  } else {
+    out_int(out, 0); // Not found
+  }
+}
+
+static void do_pttl(vector<string> &cmd, Buffer &out) {
+  Entry key;
+  key.key.swap(cmd[1]);
+  key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+  HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (!node) {
+    out_int(out, -2); // -2 means key does not exist
+    return;
+  }
+
+  Entry *ent = container_of(node, Entry, node);
+  if (ent->heap_idx == (size_t)-1) {
+    out_int(out, -1); // -1 means key exists, but has no timer
+    return;
+  }
+
+  uint64_t expire_at = g_data.heap[ent->heap_idx].val;
+  uint64_t now_us = get_monotonic_usec();
+  if (expire_at <= now_us) {
+    out_int(out, -2); // Technically expired
+    return;
+  }
+
+  uint32_t ttl_ms = (uint32_t)((expire_at - now_us) / 1000);
+  out_int(out, ttl_ms);
 }
 
 static void do_keys(vector<string> &cmd, Buffer &out) {
@@ -544,6 +645,10 @@ static void do_request(vector<string> &cmd, Buffer &out) {
     return do_set(cmd, out);
   } else if (cmd.size() == 2 && cmd[0] == "del") {
     return do_del(cmd, out);
+  } else if (cmd.size() == 3 && cmd[0] == "pexpire") {
+    return do_pexpire(cmd, out);
+  } else if (cmd.size() == 2 && cmd[0] == "pttl") {
+    return do_pttl(cmd, out);
   } else if (cmd.size() == 1 && cmd[0] == "keys") {
     return do_keys(cmd, out);
   } else if (cmd.size() == 4 && cmd[0] == "zadd") {
