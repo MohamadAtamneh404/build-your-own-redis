@@ -18,6 +18,7 @@
 // proj
 #include "dlist.h"
 #include "heap.h"
+#include "thread_pool.h"
 #include "hashtable.h"
 #include "zset.h"
 #include <math.h>
@@ -271,6 +272,9 @@ static struct {
   vector<HeapItem> heap; // The min-heap array for TTLs
 } g_data;
 
+// A global team of background workers!
+static ThreadPool g_tp;
+
 enum {
   T_STR = 0,
   T_ZSET = 1,
@@ -326,14 +330,23 @@ static void entry_del_ttl(Entry *ent) {
     ent->heap_idx = -1;
 }
 
-// Safely destroys an entry AND removes its timer!
-static void entry_destroy(Entry *ent) {
+// A wrapper that actually deletes the memory, designed to be run in a background thread!
+static void cb_destroy(void *arg) {
+    Entry *ent = (Entry *)arg;
     if (ent->type == T_ZSET) {
         zset_dispose(ent->zset);
         delete ent->zset;
     }
-    entry_del_ttl(ent); // If we delete a key, we MUST remove it from the heap!
-    delete ent;
+    delete ent; // Finally, free the memory!
+}
+
+// Safely destroys an entry AND removes its timer!
+static void entry_destroy(Entry *ent) {
+    entry_del_ttl(ent); // If we delete a key, we MUST remove it from the heap immediately on the main thread!
+    
+    // Instead of deleting the massive data structure here and blocking the event loop...
+    // We package the task into a box and hand it to the Thread Pool!
+    thread_pool_queue(&g_tp, &cb_destroy, ent);
 }
 
 // --- END TTL HELPER FUNCTIONS ---
@@ -347,6 +360,39 @@ static bool entry_eq(HNode *lhs, HNode *rhs) {
   struct Entry *re = container_of(rhs, struct Entry, node);
   // Compare the actual C++ strings
   return le->key == re->key;
+}
+
+static uint32_t next_timer_ms_kv() {
+    if (g_data.heap.empty()) {
+        return 10000; // default 10s
+    }
+    uint64_t now_us = get_monotonic_usec();
+    uint64_t expire_at = g_data.heap[0].val; // Peek at the earliest expiring key!
+    if (expire_at <= now_us) {
+        return 0; // It expired! Wake up instantly!
+    }
+    return (uint32_t)((expire_at - now_us) / 1000);
+}
+
+// The Grim Reaper for Keys!
+static void process_timers_kv() {
+    uint64_t now_us = get_monotonic_usec();
+    while (!g_data.heap.empty()) {
+        uint64_t expire_at = g_data.heap[0].val;
+        if (expire_at > now_us) {
+            break; // The earliest key hasn't expired yet. Everyone else is safe!
+        }
+        
+        // Grab the expired key!
+        Entry *ent = container_of(g_data.heap[0].ref, Entry, heap_idx);
+        
+        // First, sever its connection to the hashtable
+        HNode *node = hm_delete(&g_data.db, &ent->node, &entry_eq);
+        assert(node == &ent->node);
+        
+        // Then delete it (which will safely hand it to the background Thread Pool!)
+        entry_destroy(ent);
+    }
 }
 
 // FNV hash function. A fast, standard hashing algorithm to convert a string
@@ -822,6 +868,9 @@ int main() {
   // Initialize the global timer line
   d_list_init(&g_idle_list);
 
+  // Initialize the Background Worker Thread Pool! (4 threads)
+  thread_pool_init(&g_tp, 4);
+
   // the event loop
   vector<struct pollfd> poll_args;
   while (true) {
@@ -848,7 +897,7 @@ int main() {
     }
 
     // wait for readiness
-    int timeout_ms = (int)next_timer_ms();
+    int timeout_ms = min((int)next_timer_ms(), (int)next_timer_ms_kv());
     int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), timeout_ms);
     if (rv < 0 && errno == EINTR) {
       continue; // not an error
@@ -857,8 +906,9 @@ int main() {
       die("poll");
     }
 
-    // The Grim Reaper strikes every time the event loop wakes up!
-    process_timers();
+    // The Grim Reapers strike every time the event loop wakes up!
+    process_timers();    // Reaper for Idle Connections
+    process_timers_kv(); // Reaper for Expired Keys
 
     // handle the listening socket
     if (poll_args[0].revents) {
